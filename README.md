@@ -23,7 +23,7 @@ Secure Vault is a lightweight, cross-platform password manager built in Python. 
 
 ```
 git clone https://github.com/ae3erdion/Secure-Vault.git
-cd secure-vault
+cd Secure-Vault
 ```
 
 2. Create a Python virtual environment (recommended)
