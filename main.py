@@ -1,167 +1,229 @@
-import base64
 import os
-import string
-import random
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import getpass
+import tkinter as tk
+from tkinter import messagebox, ttk
+from secure_vault import SecureVault
+from secure_clipboard import SecureClipboard
+from password_generator import generate_password
 
-characters = list(string.ascii_letters + string.digits + "!@#$%^&*()")
-site = ""
-user = ""
-password = ""
-password_file = {}
-encrypted = ""
+VAULTS_DIR = "vaults"
+AUTOLOCK_TIMEOUT = 5 * 60 * 1000  # 5 minutes in milliseconds
 
-# Generate key for encryption
-def generate_key():
-    password = getpass.getpass()
-    password = bytes(password, 'utf-8')
-    salt = b'\xceN\x01s\xabE\x15\x02\xd9pz(1\t\xbc4'
-    kdf = PBKDF2HMAC(
-    algorithm=hashes.SHA256(),
-    length=32,
-    salt=salt,
-    iterations=480000,
-    )
-    global key
-    key = base64.urlsafe_b64encode(kdf.derive(password))
-    testkey = "7d#g8j$k2l3m5n6p7q8r9s0t@v#w$x%y^z&A*B("
-    keyhash = Fernet(key).encrypt(testkey.encode())
-# Check for the encryption key hash file exists and validate if the key is the same    
-    if os.path.exists('password.hash'):
-        with open('password.hash', 'rb') as f:
-            key_validation = f.read()
+class PasswordManagerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Secure Vault")
+        self.root.geometry("420x450")
+        self.root.resizable(False, False)
+
+        os.makedirs(VAULTS_DIR, exist_ok=True)
+
+        self.vault = None
+        self.clipboard = SecureClipboard(root, clear_after=15)
+        self.autolock_job = None
+
+        self.main_frame = tk.Frame(root)
+        self.main_frame.pack(expand=True, fill="both")
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
+
+        # Bind any keypress or mouse click to reset autolock
+        self.root.bind_all("<Any-KeyPress>", self.reset_autolock)
+        self.root.bind_all("<Any-Button>", self.reset_autolock)
+
+        self.show_login()
+
+    # ---------- Helpers ----------
+    def clear(self):
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+
+    # ---------- Login / Vault Unlock ----------
+    def show_login(self):
+        self.clear()
+        self.cancel_autolock()
+
+        tk.Label(self.main_frame, text="Secure Vault", font=("Arial", 16)).pack(pady=10)
+
+        tk.Label(self.main_frame, text="Vault Name").pack()
+        self.vault_entry = tk.Entry(self.main_frame)
+        self.vault_entry.pack()
+
+        tk.Label(self.main_frame, text="Master Password").pack(pady=(10, 0))
+        self.master_entry = tk.Entry(self.main_frame, show="*")
+        self.master_entry.pack()
+
+        tk.Button(
+            self.main_frame,
+            text="Unlock / Create Vault",
+            command=self.unlock_or_create
+        ).pack(pady=15)
+
+    def unlock_or_create(self):
+        name = self.vault_entry.get().strip()
+        password = self.master_entry.get()
+
+        if not name or not password:
+            messagebox.showerror("Error", "Vault name and password required")
+            return
+
+        vault_path = os.path.join(VAULTS_DIR, name)
+        self.vault = SecureVault(vault_path)
+
         try:
-            key_validation = Fernet(key).decrypt(key_validation)
-            if key_validation.decode() == testkey:
-                print("What would you like to do: ")    
-                menu()
+            if os.path.exists(self.vault.data_file):
+                # Existing vault → unlock
+                self.vault.unlock(password)
             else:
-                print("Wrong password ") 
-                exit
+                # First-run → create new vault
+                self.vault.create(password)
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot access vault: {str(e)}")
+            return
+
+        self.show_main_ui()
+
+    # ---------- Main UI ----------
+    def show_main_ui(self):
+        self.clear()
+        self.start_autolock_timer()
+
+        tk.Label(self.main_frame, text="Password Manager", font=("Arial", 14)).pack(pady=10)
+
+        tk.Label(self.main_frame, text="Site").pack()
+        self.site_entry = tk.Entry(self.main_frame)
+        self.site_entry.pack()
+
+        tk.Label(self.main_frame, text="Username").pack()
+        self.user_entry = tk.Entry(self.main_frame)
+        self.user_entry.pack()
+
+        tk.Label(self.main_frame, text="Password").pack()
+        self.pass_entry = tk.Entry(self.main_frame, show="*")
+        self.pass_entry.pack()
+
+        # ---------- Buttons ----------
+        tk.Button(self.main_frame, text="Generate Password", command=self.generate_password_ui).pack(pady=5)
+        tk.Button(self.main_frame, text="Save Entry", command=self.save_entry).pack(pady=5)
+        tk.Button(self.main_frame, text="Load Saved Passwords", command=self.open_load_window).pack(pady=5)
+        tk.Button(self.main_frame, text="Copy Password", command=self.copy_password).pack(pady=5)
+
+        self.status_label = tk.Label(self.main_frame, text="", fg="green")
+        self.status_label.pack(pady=10)
+
+        tk.Button(self.main_frame, text="Lock Vault", command=self.lock_vault).pack(pady=10)
+
+    # ---------- Actions ----------
+    def generate_password_ui(self):
+        self.pass_entry.config(show="*")
+        password = generate_password(length=20)
+        self.pass_entry.delete(0, tk.END)
+        self.pass_entry.insert(0, password)
+        self.clipboard.copy(password)
+        self.status_label.config(text="Password generated & copied (15s)")
+
+    def save_entry(self):
+        site = self.site_entry.get().strip()
+        user = self.user_entry.get().strip()
+        password = self.pass_entry.get().strip()
+
+        if not site or not user or not password:
+            messagebox.showerror("Error", "All fields required")
+            return
+
+        self.vault.add_entry(site, user, password)
+        self.pass_entry.config(show="*")
+        self.status_label.config(text=f"Saved entry for {site}")
+
+    # ---------- Load Window ----------
+    def open_load_window(self):
+        if not self.vault.data["entries"]:
+            messagebox.showinfo("Empty", "No saved entries")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Load Password")
+        win.geometry("320x180")
+        win.resizable(False, False)
+
+        tk.Label(win, text="Select Site").pack(pady=10)
+
+        sites = sorted(self.vault.data["entries"].keys())
+        site_var = tk.StringVar(value=sites[0])
+
+        dropdown = ttk.Combobox(win, textvariable=site_var, values=sites, state="readonly")
+        dropdown.pack(fill="x", padx=20)
+
+        def load_selected():
+            site = site_var.get()
+            entry = self.vault.get_entry(site)
+            if not entry:
+                return
+
+            self.site_entry.delete(0, tk.END)
+            self.site_entry.insert(0, site)
+
+            self.user_entry.delete(0, tk.END)
+            self.user_entry.insert(0, entry["username"])
+
+            self.pass_entry.config(show="")
+            self.pass_entry.delete(0, tk.END)
+            self.pass_entry.insert(0, entry["password"])
+
+            self.clipboard.copy(entry["password"])
+            self.status_label.config(text=f"Loaded entry for {site} (copied to clipboard)")
+
+            win.destroy()
+
+        tk.Button(win, text="Load", command=load_selected).pack(pady=15)
+
+    # ---------- Clipboard ----------
+    def copy_password(self):
+        password = self.pass_entry.get()
+        if password:
+            self.clipboard.copy(password)
+            self.status_label.config(text="Password copied (15s)")
+
+    # ---------- Lock Vault ----------
+    def lock_vault(self):
+        self.clipboard.clear()
+        if self.vault:
+            self.vault.lock()
+            self.vault = None
+        self.cancel_autolock()
+        self.show_login()
+
+    # ---------- Auto-Lock ----------
+    def start_autolock_timer(self):
+        self.cancel_autolock()
+        self.autolock_job = self.root.after(AUTOLOCK_TIMEOUT, self.auto_lock)
+
+    def reset_autolock(self, event=None):
+        if self.vault and self.vault.is_unlocked:
+            self.start_autolock_timer()
+
+    def cancel_autolock(self):
+        if self.autolock_job is not None:
+            self.root.after_cancel(self.autolock_job)
+            self.autolock_job = None
+
+    def auto_lock(self):
+        if self.vault:
+            self.vault.lock()
+            self.vault = None
+        self.clipboard.clear()
+        messagebox.showinfo("Auto-Lock", "Vault locked due to inactivity")
+        self.show_login()
+
+    # ---------- Exit ----------
+    def on_exit(self):
+        try:
+            self.clipboard.shutdown()
         except Exception:
-                print("Wrong password")
-                exit
- #If key hash file doesnt exist it create the file and write the encryption key hash to it       
-    else: 
-        with open('password.hash', 'wb') as f:
-            f.write(keyhash)
-        with open('password.encode', 'wb') as f:
-              
-            print("What would you like to do: ")
-            menu()
-        
-# Randon password generator
-def generate_password():
-    length = int(16)
-    random.shuffle(characters)
-    random_password = []
-    for i in range(length):
-        random_password.append(random.choice(characters))
-    random.shuffle(random_password)
-    random_password = ("".join(random_password))
-    print(random_password)
-    return random_password
-    
-# Write a new password to the password file
-def add_password(site, user, password_site):
-    site = base64.b64encode(site.encode()).hex()
-    user = base64.b64encode(user.encode()).hex()
-    password_file[site] = password_site
-    with open('password.encode', 'a+') as f:
-        encrypted = Fernet(key).encrypt(password_site.encode())
-        f.write(site + "," + user + ":" + encrypted.decode() + "\n")
-    
+            pass
+        self.root.destroy()
 
-# Read password file and get the password 
-def get_password(site):
-    with open('password.encode', 'r') as f:
-            for line in f:
-               site, encrypted = line. split (":")
-               site, user = site.split(",")
-               site = base64.b64decode(bytes.fromhex(site)).decode()
-               user = base64.b64decode(bytes.fromhex(user)).decode()
-               password_file[site] = user, Fernet(key).decrypt(encrypted.encode()).decode()
-    return password_file[site]
 
-# Check for all files.  
-def main():
-    if os.path.exists('password.hash') & os.path.exists('password.encode'):
-        print ("Welcome Back!")
-        generate_key()
-        
-    else:
-        print ("""
-        Welcome!
-        Create password""")
-        generate_key()
-
-# Menu of options
-def menu():
-    print("""
-    MENU
-    (1) Generate random password
-    (2) Add new password
-    (3) Get login information
-    (q) Quit""")
-
-    done = False
-    while not done:
-        choice = input("Enter choice: ")
- # When selected generate random password       
-        if choice == "1":
-            print("Your password is: ")
-            password = generate_password()
-            password = str(password) 
-# Add random password to file            
-            answer = input("Do you want to add the password? Yes/No ")
-            if answer.upper() == "YES":
-                site = input("Enter the site: ")
-                site = base64.b64encode(site.encode()).hex()
-# Check if the site already exist                    
-                with open('password.encode', 'r') as f:
-                    site_validation = f.read()
-                    if site in site_validation:
-                        print("Site already exist!")
-                    else:
-                        user = input("Enter User: ")
-                        add_password(site.upper(), user, password)
-                        print("Done!")
-            elif answer.upper() == "NO":
-                pass
-            
-
-# When selected add password to file        
-        elif choice == "2":
-            site = input("Enter the site: ")
-# Check if the site already exist             
-            with open('password.encode', 'r') as f:
-                site_validation = f.read()
-                site = base64.b64encode(site.encode()).hex()
-                if site in site_validation:
-                    print("Site already exist!")
-                    pass
-                else:
-                    user = input("Enter User: ")
-                    password = input("Enter the password: ")
-                    add_password(site.upper(), user, password)
-                    print("Done!")
-            
-# When selected retrieve password from file        
-        elif choice == "3":           
-            site = input("Enter site: ")
-            user, password = get_password(site.upper())
-            print(f"Your login information for {user} @ {site.upper()} is ({password})")
-            
-# When selected exit program        
-        elif choice == "q":
-            done = True
-            print("Bye!")
-        
-        else:
-            print("Invalid Choice")
-
-if __name__== "__main__":
-    main()        
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PasswordManagerApp(root)
+    root.mainloop()
